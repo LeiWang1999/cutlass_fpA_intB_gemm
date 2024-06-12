@@ -573,7 +573,7 @@ void preprocess_weights_for_mixed_gemm(int8_t* preprocessed_quantized_weight, co
         src_buf.swap(dst_buf);
     }
 
-    add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
+    // add_bias_and_interleave_quantized_tensor_inplace(src_buf.data(), num_elts, quant_type);
     std::copy(src_buf.begin(), src_buf.end(), preprocessed_quantized_weight);
 }
 

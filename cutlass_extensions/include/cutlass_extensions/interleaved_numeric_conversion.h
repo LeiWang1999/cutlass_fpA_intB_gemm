@@ -52,6 +52,42 @@ struct FastInterleavedAndBiasedNumericArrayConverter
 {
 };
 
+// template <>
+// struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint8_t, 4>
+// {
+//     using result_type = Array<half_t, 4>;
+//     using source_type = Array<uint8_t, 4>;
+
+//     CUTLASS_DEVICE
+//     static result_type convert(source_type const& source)
+//     {
+//         result_type result;
+
+//         uint32_t* h = reinterpret_cast<uint32_t*>(&result);
+//         uint32_t const i8s = reinterpret_cast<uint32_t const&>(source);
+
+//         static constexpr uint32_t mask_for_elt_01 = 0x5250;
+//         static constexpr uint32_t mask_for_elt_23 = 0x5351;
+//         static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
+//         asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
+//         asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
+
+//         // Lastly, we subtract 1152 from our constructed number using fp16 math to get our signed integer as fp16.
+//         static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
+//         asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
+//         asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I8s_TO_F16s_MAGIC_NUM));
+
+//         return result;
+//     }
+
+//     CUTLASS_DEVICE
+//     result_type operator()(source_type const& s)
+//     {
+//         return convert(s);
+//     }
+// };
+
+
 template <>
 struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint8_t, 4>
 {
@@ -62,20 +98,40 @@ struct FastInterleavedAndBiasedNumericArrayConverter<half_t, uint8_t, 4>
     static result_type convert(source_type const& source)
     {
         result_type result;
-
         uint32_t* h = reinterpret_cast<uint32_t*>(&result);
-        uint32_t const i8s = reinterpret_cast<uint32_t const&>(source);
-
-        static constexpr uint32_t mask_for_elt_01 = 0x5250;
-        static constexpr uint32_t mask_for_elt_23 = 0x5351;
-        static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
-        asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[0]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_01));
-        asm volatile("prmt.b32 %0,%1,%2,%3;\n" : "=r"(h[1]) : "r"(i8s), "n"(start_byte_for_fp16), "n"(mask_for_elt_23));
-
-        // Lastly, we subtract 1152 from our constructed number using fp16 math to get our signed integer as fp16.
-        static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64806480;
-        asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(I8s_TO_F16s_MAGIC_NUM));
-        asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[1]) : "r"(h[1]), "r"(I8s_TO_F16s_MAGIC_NUM));
+        uint32_t i8s = reinterpret_cast<uint32_t const&>(source);
+        // int8 -> fp16
+        // half* half_h = reinterpret_cast<half*>(h);
+        // for (int i = 0; i < 4; ++i){
+        //     int8_t i8 = (i8s >> (i * 8)) & 0xff;
+        //     half_h[i] = half(float(i8));
+        // }
+        // e5m2 -> fp16
+        // half* half_h = reinterpret_cast<half*>(h);
+        // for (int i = 0; i < 4; ++i){
+        //     uint16_t i8 = ((i8s >> (i * 8)) & 0xff) << 8;
+        //     half_h[i] = *(half*)&i8;
+        // }
+    
+        // e4m3 -> fp16
+        asm volatile(
+            "{                                      \n"
+            ".reg .b32 a0, a1, b0, b1, r0, r1;      \n"
+            "prmt.b32 a0, 0, %2, 0x5040;            \n"  // a0 = 0xf300f400
+            "prmt.b32 a1, 0, %2, 0x7060;            \n"  // a1 = 0xf100f200
+            "lop3.b32 b0, a0, 0x7fff7fff, 0, 0xc0;  \n"  // b0 = a0 & 0x7fff7fff
+            "lop3.b32 b1, a1, 0x7fff7fff, 0, 0xc0;  \n"  // b1 = a1 & 0x7fff7fff
+            "shr.b32  b0, b0, 1;                    \n"  // b0 >>= 1
+            "shr.b32  b1, b1, 1;                    \n"  // b1 >>= 1
+            "add.u32  b0, b0, 0x20002000;           \n"  // b0 += 8<<10 | 8<<10<<16
+            "add.u32  b1, b1, 0x20002000;           \n"  // b1 += 8<<10 | 8<<10<<16
+            "lop3.b32 r0, b0, 0x80008000, a0, 0xf8; \n"  // r0 = b0 | (0x80008000 & a0)
+            "lop3.b32 r1, b1, 0x80008000, a1, 0xf8; \n"  // r1 = b1 | (0x80008000 & a1)
+            "mov.b32 %0, r0;                        \n"  // h[0] = r0
+            "mov.b32 %1, r1;                        \n"  // h[1] = r1
+            "}" 
+            : "=r"(h[0]), "=r"(h[1]) : "r"(i8s)
+        );
 
         return result;
     }
